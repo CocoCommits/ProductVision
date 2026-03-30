@@ -23,7 +23,10 @@
 10. [Phase 1A — Dashboard & Visualization](#10-phase-1a--dashboard--visualization)
 11. [Phase 1A — Holdings & Transaction Management](#11-phase-1a--holdings--transaction-management)
 12. [Phase 1A — Family Accounts](#12-phase-1a--family-accounts)
-13. [Phase 1B — Remote Access via Cloudflare Tunnel](#13-phase-1b--remote-access-via-cloudflare-tunnel)
+12a. [Phase 1A — Admin Panel & Permission Enforcement](#12a-phase-1a--admin-panel--permission-enforcement)
+12b. [Phase 1A — Corporate Actions System](#12b-phase-1a--corporate-actions-system)
+12c. [Phase 1A — Holdings Baseline Check](#12c-phase-1a--holdings-baseline-check)
+13. [Phase 1B — Remote Access via ZROK & Cloudflare Worker](#13-phase-1b--remote-access-via-zrok--cloudflare-worker)
 14. [Phase 2 — Expense Tracker](#14-phase-2--expense-tracker)
 15. [Phase 2 — Loan Simulation Engine](#15-phase-2--loan-simulation-engine)
 16. [Phase 2 — Tax Simulation Engine](#16-phase-2--tax-simulation-engine)
@@ -40,13 +43,15 @@
 
 NEESH is a self-hosted personal wealth management web application designed to consolidate all investments, income streams, and (in later phases) expenses across multiple financial platforms into a single unified dashboard. The application runs on a Raspberry Pi 4 (4GB RAM) and serves up to 15 users across 5 families.
 
-The system uses AI (Google Gemini Free Tier) to parse account statements from various brokers, tracks live market prices, handles multi-currency foreign investments with proper tax classification, and provides a consolidated net worth view at both individual and family levels.
+The system uses a layered AI pipeline (local regex parser → Google Gemini Flash/Pro → LiteLLM fallback) to parse account statements from various brokers, tracks live market prices, handles multi-currency foreign investments with proper tax classification, automatically detects corporate actions (bonus/split/demerger/merger) via daily NSE sync, and provides a consolidated net worth view at both individual and family levels.
 
 **Key Differentiators:**
 - Completely self-hosted — no data leaves the user's home network (except for API calls to market data and AI services)
-- AI-powered statement parsing eliminates manual data entry for bulk imports
+- AI-powered statement parsing eliminates manual data entry for bulk imports (supports Excel, CSV, PDF, and images via Gemini vision)
 - Unified view across 11 asset classes, multiple brokers, and multiple currencies
 - Family-level aggregation with shared visibility
+- Corporate actions auto-detection: bonus, split, symbol change, demerger, and merger detected from NSE and applied with user approval
+- FIFO cost basis for direct equity, matching Zerodha's holdings display
 - Designed with a common base asset class architecture for easy extensibility and future tax simulation
 
 ---
@@ -71,10 +76,10 @@ A single, private, self-hosted application that answers the question: **"What is
 
 ## 3. Project Phases
 
-| Phase | Name | Scope | Priority |
-|-------|------|-------|----------|
-| **Phase 1A** | Investment & Income Tracker | 11 asset classes, income tracking, AI import, live prices, net worth dashboard, family accounts, basic loan tracking, display-only tax classification | 🔴 Current Focus |
-| **Phase 1B** | Remote Access | Cloudflare Tunnel setup for secure access outside home network | 🟡 Near-term (end of Phase 1) |
+| Phase | Name | Scope | Status |
+|-------|------|-------|--------|
+| **Phase 1A** | Investment & Income Tracker | 11 asset classes, income tracking, AI import (including salary slips), live prices, net worth dashboard, family accounts, corporate actions (bonus/split/demerger/merger), admin panel, holdings baseline check, display-only tax classification | ✅ Implemented (Sprint 0–18) |
+| **Phase 1B** | Remote Access | ZROK static URL + Cloudflare Worker for secure access outside home network. Backup to Google Drive. | ✅ Implemented (Sprint 10, 15) |
 | **Phase 2** | Expense Tracker + Loan Simulation + Tax Simulation | Google Sheet-based expense tracking, advanced loan repayment simulation engine, what-if tax scenarios | 🟢 Future |
 | **Phase 3** | AI Investment Planning Assistant | AI-driven strategy analysis, technical indicator evaluation, strategy deviation notifications (WhatsApp/Email) | 🟢 Future |
 
@@ -86,17 +91,44 @@ A single, private, self-hosted application that answers the question: **"What is
 
 | Aspect | Detail |
 |--------|--------|
-| **Method** | WhatsApp-based OTP |
-| **Provider** | Twilio WhatsApp Business API (or equivalent) |
+| **Identifier** | Phone number OR email address (single input field, auto-detected) |
+| **Method** | 6-digit OTP |
+| **OTP Delivery Priority** | 1. WhatsApp Cloud API (Meta, free tier) → 2. Email SMTP (Gmail or any) → 3. Console output (dev only) |
+| **Legacy Provider** | Twilio WhatsApp (deprecated — config still accepted but WhatsApp Cloud API preferred) |
 | **Session** | JWT token issued on OTP verification |
 | **Token Expiry** | Configurable (recommended: 7 days with refresh) |
 
 **Authentication Flow:**
-1. User enters phone number on login screen
-2. Backend generates a 6-digit OTP and sends via WhatsApp (Twilio API)
-3. User enters OTP on login screen
-4. Backend verifies OTP, issues JWT session token
-5. User is redirected to dashboard
+
+```mermaid
+flowchart TD
+    Login["Login Page\nEnter phone number or email"]
+    Detect{Contains '@'?}
+    ByEmail["Lookup user by email"]
+    ByPhone["Lookup user by phone"]
+    WA{"WHATSAPP_PHONE_NUMBER_ID\nconfigured?"}
+    SMTP{"SMTP_HOST\nconfigured?"}
+    SendWA["Send OTP via\nWhatsApp Cloud API"]
+    SendEmail["Send OTP via\nEmail SMTP"]
+    Console["Print OTP to\nconsole (dev only)"]
+    Verify["User enters OTP → verify hash\nIssue JWT token"]
+
+    Login --> Detect
+    Detect -->|Yes| ByEmail
+    Detect -->|No| ByPhone
+    ByEmail --> WA
+    ByPhone --> WA
+    WA -->|Yes| SendWA --> Verify
+    WA -->|No| SMTP
+    SMTP -->|Yes| SendEmail --> Verify
+    SMTP -->|No| Console --> Verify
+```
+
+1. User enters phone or email → backend detects type
+2. OTP generated (6-digit), hashed and stored with expiry
+3. OTP sent via highest-priority available channel
+4. User enters OTP → verified against stored hash
+5. JWT token issued, user redirected to dashboard
 
 ### 4.2 User Profile
 
@@ -104,6 +136,7 @@ A single, private, self-hosted application that answers the question: **"What is
 |-------|------|--------------------------|-------------|
 | Name | Text | Yes | Full name |
 | Phone | Text | Yes | WhatsApp number (unique, used for login) |
+| Email | Text | No | Email address (optional, unique; can be used as alternative login identifier) |
 | Date of Birth | Date (ISO) | Yes | User's date of birth. Age is computed dynamically from DOB. |
 | Monthly Income | Decimal | No* | Gross monthly income (INR) |
 | Bonus | Decimal | No* | Annual bonus amount |
@@ -167,10 +200,10 @@ A single, private, self-hosted application that answers the question: **"What is
 | **Backend Framework** | FastAPI | Async support, lightweight, excellent for API-first design with server-rendered templates |
 | **Frontend** | Jinja2 templates + HTMX + Tailwind CSS + Chart.js | Server-rendered pages with dynamic interactivity via HTMX. No separate build toolchain. Chart.js for pie charts, bar charts, and line graphs |
 | **Database** | SQLite (WAL mode) | No daemon process, minimal memory, sufficient for 15 users. WAL mode for concurrent reads. Weekly automated backups for data safety over 50-60 year lifespan |
-| **AI Engine** | Google Gemini Free Tier | Statement parsing, data extraction, re-verification |
-| **Authentication** | WhatsApp OTP via Twilio | User preference |
+| **AI Engine** | Google Gemini Flash/Pro + LiteLLM + Local Regex Parser | Three-tier pipeline: local parser for known formats (zero API cost), Gemini Flash for extraction, Gemini Pro for verification, LiteLLM as fallback for OpenAI-compatible endpoints (e.g., TI internal gateway). Multiple Gemini API keys supported for quota rotation. |
+| **Authentication** | WhatsApp Cloud API (Meta) → Email SMTP → Console fallback | Priority-chain OTP delivery. WhatsApp Cloud API is primary (free tier). Email SMTP (Gmail or any SMTP server) is secondary. Console output for dev mode. Twilio config still accepted but deprecated. |
 | **Task Scheduling** | APScheduler (Python) | Background jobs for price refresh, expense sync, within the same Python process — no separate worker needed |
-| **Remote Access** | Cloudflare Tunnel (Phase 1B) | Secure HTTPS access without port forwarding or static IP |
+| **Remote Access** | ZROK static share URL + Cloudflare Worker (Phase 1B) | ZROK provides a persistent tunnel URL. A Cloudflare Worker with KV storage holds the current URL; landing page (`neesh.pages.dev`) fetches it dynamically. No port forwarding or static IP required. |
 
 ### 5.2 System Architecture
 
@@ -182,22 +215,32 @@ The application is a monolithic Python application running on the Raspberry Pi. 
 |-----------|------|
 | **FastAPI Web Server** | Serves HTML pages (Jinja2), handles API requests, authentication |
 | **HTMX Frontend Layer** | Provides dynamic interactions (partial page updates, form submissions) without full-page reloads |
-| **APScheduler** | Runs background tasks: daily price refresh, weekly expense sync (Phase 2), periodic Zerodha token refresh |
-| **Gemini Integration Module** | Sends statement content to Gemini API, receives structured JSON, performs re-verification |
-| **Market Data Module** | Fetches live prices from yfinance / Google Finance, caches in SQLite |
-| **Zerodha Kite Module** | OAuth flow, fetches holdings/positions/orders via Kite Connect API |
-| **Currency Module** | Fetches RBI reference rates for INR conversion |
+| **APScheduler** | Runs background tasks: daily price refresh, daily corporate actions sync, weekly symbol cleanup, weekly local backup, monthly Google Drive backup, recurring income/transaction generation |
+| **AI Module** | Three-tier pipeline: local regex parser → Gemini Flash (extraction) → Gemini Pro (verification) → LiteLLM fallback. `robust_llm_call()` in `llm_utils.py` handles retry, JSON validation, and truncation. |
+| **Market Data Module** | Fetches live prices from yfinance (primary) / AMFI NAV API / RBI reference rates, caches in SQLite `price_cache` table |
+| **Corporate Actions Module** | NSE API integration for daily CA sync (bonus, split, merger, symbol change, demerger). `CorporateActionsService` matches CAs to holdings and creates user-approval pending tasks. `CorporateActionsImportService` handles pre-import analysis for historical tradebooks. |
+| **Zerodha Kite Module** | OAuth flow, fetches holdings/positions/orders via Kite Connect API. CSV upload is the primary import path; Kite API is an optional enhancement. |
+| **Currency Module** | Fetches RBI reference rates for INR conversion. Historical rates cached permanently once fetched. |
+| **Backup Module** | Weekly local SQLite backup (configurable retention). Monthly Google Drive backup via service account JSON with AES-256 encryption. On-demand backup + download from admin panel. |
+| **Audit Log** | All write operations (create/update/delete holdings, transactions, income) are logged with user, action type, entity, and timestamp. |
 
 **External Services:**
 
 | Service | Purpose | Data Flow |
 |---------|---------|-----------|
-| Google Gemini API | Statement parsing + re-verification | Outbound only (file content sent, structured JSON received) |
-| Twilio WhatsApp API | OTP delivery | Outbound (OTP sent to user's WhatsApp) |
-| yfinance / Google Finance | Live market prices | Outbound (price queries) |
-| RBI Reference Rates | USD/INR and other forex rates | Outbound (rate queries) |
-| Zerodha Kite Connect | Holdings, positions, orders, live quotes | Outbound (API calls after OAuth) |
-| Cloudflare Tunnel (Phase 1B) | Secure remote access | Inbound tunnel from Cloudflare edge |
+| Google Gemini API (Flash + Pro) | Statement parsing + salary slip extraction + verification. Gemini Flash for extraction, Gemini Pro for verification. Supports images (JPG/PNG) via Gemini vision (Sprint 18). | Outbound only (file/image content sent, structured JSON received) |
+| LiteLLM / OpenAI-compatible endpoint | Alternative AI endpoint (e.g., TI internal gateway). Fallback when Gemini is unavailable or rate-limited. | Outbound (prompt + content sent, JSON received) |
+| WhatsApp Cloud API (Meta) | OTP delivery (primary). Free tier via Meta Business. | Outbound (OTP sent to user's WhatsApp) |
+| Email SMTP | OTP delivery (secondary). Gmail App Password or any SMTP server. | Outbound (OTP email sent) |
+| Twilio WhatsApp (Legacy) | OTP delivery — deprecated, replaced by WhatsApp Cloud API | Outbound (config still accepted for backward compatibility) |
+| yfinance | Live and historical prices for Indian equities (NSE/BSE suffix), global equities, ETFs | Outbound (price queries) |
+| AMFI NAV API | Indian mutual fund daily NAV | Outbound (NAV queries) |
+| RBI Reference Rates | USD/INR and other forex rates for INR conversion | Outbound (rate queries) |
+| NSE Corporate Actions API | Daily bonus/split/merger/demerger detection | Outbound (scheduled, active symbols only) |
+| Zerodha Kite Connect | Holdings, positions, orders via OAuth | Outbound (API calls after OAuth) |
+| Google Drive (Service Account) | Monthly encrypted backup storage | Outbound (backup files uploaded) |
+| ZROK Tunnel | Inbound remote access tunnel (Phase 1B) | Inbound HTTPS tunnel, no port forwarding |
+| Cloudflare Worker + KV | Landing page URL registry — stores current ZROK URL; updated on tunnel restart | Outbound (URL update from Pi on restart) |
 
 ### 5.3 Performance Considerations for Raspberry Pi 4
 
@@ -211,13 +254,18 @@ The application is a monolithic Python application running on the Raspberry Pi. 
 
 ### 5.4 Backup Strategy
 
+| Backup Type | Frequency | Storage | Detail |
+|------------|-----------|---------|--------|
+| **Local backup** | Weekly (APScheduler) | Configurable `BACKUP_DIR` path | Compressed SQLite snapshot (`.db.gz`). Keeps last `BACKUP_KEEP_COUNT` files (default 8). |
+| **Google Drive backup** | Monthly (APScheduler) | Specific Drive folder via service account JSON | AES-256 encrypted via Fernet before upload. Retains last `GDRIVE_BACKUP_KEEP_COUNT` monthly snapshots (default 12). Leave `GDRIVE_FOLDER_ID` blank to disable. |
+| **On-demand backup** | Admin-triggered | Local + Drive | Admin panel button triggers immediate backup. Admin can also download the latest backup directly from the browser. |
+
 | Aspect | Detail |
 |--------|--------|
-| **Frequency** | Weekly automated backup (SQLite `.backup` command) |
-| **Retention** | Keep last 12 weekly backups + monthly backups for 5 years |
-| **Storage** | Local backup to USB drive + optional cloud sync (rclone to Google Drive / S3) |
-| **Recovery** | Simple file copy to restore SQLite database |
-| **Integrity** | SHA-256 checksum on each backup file |
+| **Encryption** | AES-256 (Fernet) for Drive backups. Local backups are unencrypted — use full-disk encryption (LUKS) on the Pi for local security. |
+| **Recovery** | Decompress `.db.gz` → copy to `DATABASE_PATH`. |
+| **Integrity** | Compressed archives — corruption detectable on extraction. |
+| **Configuration** | `BACKUP_DIR`, `BACKUP_KEEP_COUNT`, `BACKUP_ENCRYPTION_KEY`, `GDRIVE_FOLDER_ID`, `GDRIVE_SERVICE_ACCOUNT_JSON`, `GDRIVE_BACKUP_KEEP_COUNT` in `.env.prod` |
 
 ---
 
@@ -458,55 +506,127 @@ The application is a monolithic Python application running on the Raspberry Pi. 
 
 ## 7. Phase 1A — Income Tracker
 
-### 7.1 Supported Income Types
+### 7.1 Two-Layer Architecture
 
-| # | Income Type | Recurring | Auto-Linked to Investments | Data Source |
-|---|-------------|-----------|---------------------------|-------------|
-| 1 | Salary | ✅ Monthly | ❌ | Manual entry |
-| 2 | Bonuses | ❌ Occasional | ❌ | Manual entry |
-| 3 | Dividends (Equity) | ✅ Periodic | ✅ Linked to stock/MF holding | Excel upload |
-| 4 | Interest Income (FD/RD/Savings) | ✅ Periodic | ✅ Auto-computed for fixed assets | Auto-calculated (no input needed unless early exit) |
-| 5 | Rental Income | ✅ Monthly | ❌ | Manual entry |
-| 6 | Capital Gains | ❌ On sale | ✅ Auto-captured from sell transactions | Auto-calculated from investment tracker |
-| 7 | Freelance / Side Income | ❌ Variable | ❌ | Manual entry |
-| 8 | Gifts / Windfalls | ❌ Rare | ❌ | Manual entry |
+Income handling is split into two distinct layers that serve different purposes:
 
-### 7.2 Income Parameters
+```mermaid
+flowchart TD
+    subgraph L1["Layer 1 — Income Record (FY-level summary)"]
+        IR["income table\nONE entry per FY per source\nStores: gross amount, TDS, financial year, source\nExample: Salary FY 2025-26 — avg ₹1,00,000/mo, TDS ₹10,000/mo"]
+    end
+
+    subgraph L2["Layer 2 — Transaction Entries (monthly record-keeping)"]
+        BC["Bank CREDIT transaction\nNet pay = gross - TDS\nAffects bank account balance ✅"]
+        TDS["TDS reference transaction\nAmount = TDS withheld by employer\nInformational only — does NOT affect balance ⛔"]
+        PF["PF/NPS contribution transactions\nEmployee + employer contributions\nPosted to provident_fund / nps asset"]
+        Event["Event income entries\nBonus / perquisite — separate income records\nNot part of the FY template"]
+    end
+
+    IR -->|"generates per month"| BC
+    IR -->|"generates per month (if TDS > 0)"| TDS
+    IR -->|"generates per month (if PF/NPS opted)"| PF
+    IR -->|"one-off events"| Event
+```
+
+**Why two layers?**
+- Layer 1 answers *"How much did I earn this FY?"* — used for income summary, tax filing overview, dashboard.
+- Layer 2 answers *"What actually happened to my money each month?"* — bank credits update the bank account balance, TDS explains why the credit is less than gross.
+
+### 7.2 Supported Income Types
+
+| # | Income Type | TDS Tracked | Auto Bank Credit | Data Source |
+|---|-------------|-------------|------------------|-------------|
+| 1 | `salary` | ✅ | ✅ (net pay → bank account) | AI salary slip import (PDF/Excel/Image) or manual |
+| 2 | `bonus` | ✅ | ✅ | AI salary slip import or manual |
+| 3 | `perquisite` | ✅ | ❌ (non-cash, e.g. RSU vest) | Manual or salary import |
+| 4 | `dividend` | ✅ | ✅ | Auto-created from dividend transactions |
+| 5 | `interest` | ✅ | ✅ | Manual entry; auto-created from FD/SGB/bank transactions |
+| 6 | `rental` | ✅ | ✅ | Manual entry |
+| 7 | `capital_gains` | ❌ | ❌ | Auto-created on sell transaction |
+| 8 | `freelance` | ✅ | ✅ | Manual entry |
+| 9 | `gift` | ❌ | ✅ | Manual entry |
+
+**Bank credit auto-creation:** When `credited_to_account` is set on an income entry, a `credit` transaction is automatically created on the named bank account holding for the **net amount (gross − TDS)**. This keeps the bank account balance accurate without manual double-entry.
+
+**TDS tracking:** TDS amounts are stored on the income record for FY tax filing reference. A separate `tds` transaction type records what was withheld at source each month — this transaction is **informational only and does not affect bank account balance computation**.
+
+### 7.3 Income Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| Income Type | Enum | Yes | From the list above |
-| Source Description | Text | Yes | E.g., "TCS Dividend Q3", "SBI FD Interest", "Rent — Flat 2" |
-| Amount | Decimal | Yes | Income amount (INR) |
-| Currency | Enum | No | Default INR. USD/other for foreign income |
+| Income Type | Enum | Yes | One of the 9 types above |
+| Source Description | Text | Yes | E.g., "TCS Dividend Q3", "SBI FD Interest", "Monthly Salary" |
+| Amount (Gross) | Decimal | Yes | Gross income amount (INR), before TDS |
+| TDS Amount | Decimal | No | Tax deducted at source (shown for TDS income types) |
+| Currency | Enum | No | Default INR |
 | Date Received | Date | Yes | Date of receipt |
 | Financial Year | Text | Yes | Auto-derived from date (Apr–Mar Indian FY) |
-| Linked Asset | FK | No | Reference to the investment this income is from |
-| Recurring | Boolean | No | Whether this is a recurring income stream |
-| Recurrence Frequency | Enum | No | Monthly / Quarterly / Half-Yearly / Yearly |
+| Linked Asset / Transaction | FK | No | Reference to the holding this income came from (for XIRR) |
+| Credited To Account | Text | No | Bank account name — triggers auto bank credit transaction |
 | Notes | Text | No | Additional details |
 
-### 7.3 Income Tracking Rules
+### 7.4 Salary Slip Import Flow
 
-**Interest for Fixed Assets (FDs, RDs, SGBs, PF):**
-- Interest income is auto-calculated based on the principal, interest rate, and compounding frequency stored in the investment record
-- No additional user input is required unless the asset is exited before maturity (early withdrawal)
-- If early exit occurs, user updates the investment record, and interest is recalculated up to the exit date
+Salary import (Sprint 6/18) is the primary data source for salary, bonus, perquisite, PF, and NPS income. Accepts PDF, Excel, CSV, or image files (JPG/PNG via Gemini vision).
 
-**Dividends (Equity, MFs):**
-- User uploads an Excel/CSV file containing dividend details
-- AI agent parses the file and links each dividend entry to the corresponding holding
-- Dividend income is stored per asset for accurate XIRR calculation
+```mermaid
+flowchart TD
+    Upload["Upload Salary Slip\nPDF / Excel / Image"]
+    AI["AI Extraction\nGemini Flash / LiteLLM\nExtracts: employee, company, month, gross,\ndeductions, net pay, TDS, PF, NPS per month"]
+    Review["User Reviews\nExtracted monthly data\nSelects bank account + PF/NPS options"]
+    Confirm["Confirm Import"]
 
-**Capital Gains:**
-- Automatically captured when a sell transaction is recorded in the investment tracker
-- Stored as income linked to the original investment for XIRR computation
+    subgraph created["What Gets Created"]
+        FY["ONE FY income entry\nAverage monthly salary values\nTotal annual TDS"]
+        BankC["Bank CREDIT transaction × N months\nNet pay per month → bank account"]
+        TDST["TDS reference transaction × N months\nInformational · does not affect balance"]
+        PFT["PF contribution transactions × N months\nEmployee + employer contributions\n→ provident_fund asset"]
+        NPST["NPS contribution transactions × N months\n→ nps asset (if opted)"]
+        EventI["Bonus / perquisite income entries\nSeparate records for one-off events"]
+    end
 
-**XIRR Calculation:**
-- All income streams linked to an asset (dividends, interest, capital gains) are treated as cash inflows
-- All purchases are treated as cash outflows
-- XIRR is computed per asset, per asset class, and across the entire portfolio
-- This provides the most accurate annualized return metric that accounts for the timing of all cash flows
+    Upload --> AI --> Review --> Confirm --> created
+```
+
+### 7.5 Dividend & Interest Income
+
+**Dividends:** Auto-created as income records when a `dividend` transaction is posted to a `direct_equity` or `mutual_fund` holding. Linked to the holding via `linked_transaction_id` for XIRR.
+
+**Interest:** Auto-created when an `interest` transaction is posted to `fixed_deposit`, `sgb`, or `bank_account` holdings. Users enter interest manually or via a bank statement import.
+
+**Capital Gains:** Auto-created when a `sell` transaction is posted. Stored linked to the original holding for XIRR computation.
+
+**PF Interest:** Tracked via the annual reminder system. When the EPF balance update reminder is due, the user enters the current balance — the system creates a `balance_update` transaction on the provident_fund holding and an `interest` income record.
+
+### 7.6 Income Source Linking
+
+| Income Type | Linked Via | Source Reference |
+|-------------|------------|------------------|
+| dividend | `linked_transaction_id` | `direct_equity:RELIANCE` |
+| interest (FD) | `linked_symbol` | `fixed_deposit:SBI_FD_2024` |
+| interest (SGB) | `linked_symbol` | `sgb:SGB2024-25-III` |
+| interest (Bank) | `linked_symbol` | `bank_account:HDFC_Savings` |
+| perquisite | `linked_transaction_id` | `rsu:GOOGL_2024_Grant` |
+| capital_gains | `linked_transaction_id` | sell transaction on the holding |
+
+### 7.7 XIRR Calculation
+
+All income streams linked to a holding are treated as cash inflows when computing XIRR:
+- Purchases → cash outflows
+- Dividends, interest, capital gains linked to the asset → cash inflows
+- XIRR computed per asset, per asset class, and across the entire portfolio
+
+### 7.8 Tax Deduction Reference (80TTA / 80TTB)
+
+The `TaxService` computes savings interest deductions for tax filing reference:
+
+| Section | Eligibility | Max Deduction | Scope |
+|---------|-------------|---------------|-------|
+| 80TTA | Non-seniors | ₹10,000 | Savings bank interest only |
+| 80TTB | Seniors (60+) | ₹50,000 | All interest (FD + savings + recurring deposits) |
+
+*Note: Tax computation is display-only in Phase 1. NEESH does not file taxes.*
 
 ---
 
@@ -514,41 +634,36 @@ The application is a monolithic Python application running on the Raspberry Pi. 
 
 ### 8.1 Overview
 
-Users upload account statements (Excel or CSV) from various brokers and platforms. The Google Gemini AI agent parses the uploaded file, extracts structured transaction data, and maps it to the application's standardized schema. A re-verification step ensures accuracy before data is committed to the database.
+Users upload account statements from various brokers. The system uses a three-tier AI pipeline to extract transactions: a local regex parser for known formats (zero API cost), Gemini Flash for AI extraction, and Gemini Pro for verification. Salary slips are a separate import flow (Sprint 6/18) supporting PDF and images.
+
+The system also detects corporate actions within the import (demerger cost-basis splitting, merger swap ratios) before committing data — see Section 12b.
 
 ### 8.2 Supported File Formats
 
-| Format | Support |
-|--------|---------|
-| Excel (.xlsx, .xls) | ✅ |
-| CSV (.csv) | ✅ |
-| PDF | ❌ Not in Phase 1 |
+| Format | Transaction Import | Salary Import |
+|--------|--------------------|---------------|
+| Excel (.xlsx, .xls) | ✅ | ✅ |
+| CSV (.csv) | ✅ | ✅ |
+| PDF | ✅ (via Gemini) | ✅ (via Gemini) |
+| Image (JPG/PNG) | ✅ (via Gemini vision, Sprint 18) | ✅ (via Gemini vision, Sprint 18) |
 
 ### 8.3 Import Pipeline
 
-**Step 1 — Upload**
-User uploads an Excel/CSV file from any broker or platform (Zerodha, ICICI Direct, Groww, bank statements, MF CAS reports, RSU/ESOP grant documents).
+```mermaid
+flowchart TD
+    Upload["📁 Upload File\nExcel / CSV / PDF / Image"]
+    Local["Step 1 · Local Parser\nRegex for Zerodha, CAMS, NSDL\nZero API cost · detects zero-cost CA entries"]
+    Extract["Step 2 · AI Extraction\nGemini Flash / LiteLLM\nStructured prompt + JSON schema\nrobust_llm_call: retry + JSON validation"]
+    Verify["Step 3 · AI Verification\nGemini Pro / LiteLLM\nValidates totals, dates, quantities\nConfidence per field"]
+    CA["Step 4 · Corporate Actions Analysis\nDetect demerger / merger patterns\nOffer cost-basis transformation\nFilter zero-cost entries"]
+    Review["Step 5 · User Review Page\nHigh-confidence → shown normally\nFlagged fields → highlighted\nCA transformations → before/after preview\nUser approves, edits, or rejects"]
+    Commit["Step 6 · Commit\nTransactions inserted · holdings recomputed\nImport log entry created\nSymbol fetch tracking updated"]
 
-**Step 2 — AI Extraction**
-The file content is sent to Google Gemini Free Tier with a structured prompt that includes:
-- The application's target JSON schema for the relevant asset class
-- Example mappings for common broker formats
-- Instructions to handle ambiguities by flagging them
-
-**Step 3 — AI Re-verification**
-A second Gemini call receives:
-- The original file content
-- The extracted JSON from Step 2
-- Instructions to verify: validate totals, check date consistency, flag anomalies (negative quantities, future dates, mismatched symbols), and provide a confidence score per field
-
-**Step 4 — User Review**
-The extracted and verified data is presented to the user in a review screen:
-- Fields with high confidence are shown normally
-- Fields with low confidence or flagged anomalies are highlighted for user attention
-- User can approve, edit individual fields, or reject the entire import
-
-**Step 5 — Commit**
-On user approval, data is inserted into the SQLite database. An import log entry is created for audit purposes.
+    Upload --> Local
+    Local -->|known format| CA
+    Local -->|unrecognized| Extract --> Verify --> CA
+    CA --> Review -->|approved| Commit
+```
 
 ### 8.4 Import Log
 
@@ -840,37 +955,179 @@ A toggle switch "View: Individual ↔ Family" is present on the dashboard. When 
 
 ---
 
-## 13. Phase 1B — Remote Access via Cloudflare Tunnel
+## 12a. Phase 1A — Admin Panel & Permission Enforcement
+
+### 12a.1 Overview
+
+An admin dashboard accessible only to users with the `admin` role (first registered user or user matching `ADMIN_PHONE` env var). Provides system-wide visibility and controls that are hidden from regular users.
+
+### 12a.2 Admin Capabilities
+
+| Capability | Detail |
+|------------|--------|
+| **User Management** | View all users, soft-delete accounts, view login activity |
+| **Family Management** | View all families, members, roles |
+| **Audit Log** | View all write operations across all users (entity type, action, timestamp, user) |
+| **On-Demand Sync** | Trigger corporate actions sync immediately (without waiting for daily job) |
+| **On-Demand Backup** | Trigger backup now + download latest backup file |
+| **Write Access Controls** | Enforce that Viewers cannot write; enforce family-scoped access for non-admins |
+
+### 12a.3 Audit Logging
+
+All write operations (create/update/delete on holdings, transactions, income, corporate actions) are logged to the `audit_log` table with:
+- `user_id` — who performed the action
+- `action` — CREATE / UPDATE / DELETE
+- `entity_type` — holding / transaction / income / corporate_action
+- `entity_id` — the affected record
+- `timestamp`
+
+The Admin can filter the audit log by user, entity type, or date range.
+
+---
+
+## 12b. Phase 1A — Corporate Actions System
+
+### 12b.1 Overview
+
+Corporate actions (bonus shares, stock splits, symbol changes, demergers, mergers) automatically affect the quantity and cost basis of equity holdings. NEESH auto-detects these from NSE and surfaces them for user approval — it never silently mutates holdings.
+
+```mermaid
+flowchart TD
+    Job["⏰ Daily 6 AM IST Job"]
+    NSE["NSE API Fetch\nActive symbols only\nBonus · Split · Merger · Symbol Change · Demerger\nDate range: first_entry_date → today"]
+    Match["Match to User Holdings\nby Symbol + ISIN\nCreate pending user_actions"]
+    Page["Actions & Notifications Page\nBadge shows pending count"]
+    Approve{User decision}
+
+    Bonus["Bonus\nAdd shares at ₹0 cost\nRecalculate avg buy price"]
+    Split["Split\nMultiply qty by ratio\nDivide price by ratio across all txns"]
+    SymChange["Symbol Change\nRename in all holdings + transactions"]
+    Demerger["Demerger\nMark parent consumed\nCreate children with inherited purchase dates\n+ split cost basis (e.g. 31.15% / 68.85%)"]
+    Merger["Merger\nMark parent consumed\nCreate merged holding with swap ratio\n+ inherited purchase date"]
+
+    Job --> NSE --> Match --> Page --> Approve
+    Approve -->|Bonus| Bonus
+    Approve -->|Split| Split
+    Approve -->|Symbol Change| SymChange
+    Approve -->|Demerger| Demerger
+    Approve -->|Merger| Merger
+    Approve -->|Dismiss| Done["Dismissed\n(no change)"]
+```
+
+### 12b.2 Action Types
+
+| Action | Auto-Apply Support | Key Logic |
+|--------|--------------------|-----------|
+| **Bonus** | Yes (user approval required) | Add bonus shares at ₹0 cost. Avg buy price recalculated. |
+| **Split** | Yes (user approval required) | Multiply all transaction quantities by ratio. Divide all prices by ratio. |
+| **Symbol Change** | Yes (user approval required) | Rename symbol in all holdings and transactions. |
+| **Demerger** | Yes (user approval required) | Parent transaction marked `consumed_by_demerger`. Child transactions created with **inherited purchase dates** and split cost basis (e.g., TATAMOTORS → TMLCV 31.15% + TMLPV 68.85%). |
+| **Merger** | Yes (user approval required) | Parent marked `consumed_by_merger`. New transaction created with swap ratio (e.g., 100 HDFCLTD → 168 HDFCBANK at 42:25), **inherited purchase date**. |
+
+### 12b.3 Historical Reconciliation (Sprint 16)
+
+When a user imports 5 years of tradebook history, all historical CAs (bonus/split prior to the import date) are also fetched and surfaced:
+- `symbol_fetch_tracking.first_entry_date` defines the start of the CA fetch range
+- Holdings page shows ⚠️ warning if unapplied CAs detected
+- One-click apply from the Holdings page for each discrepancy
+
+### 12b.4 Key Database Tables
+
+| Table | Purpose |
+|-------|---------|
+| `corporate_actions` | CA records fetched from NSE (symbol, type, ex_date, ratio, metadata) |
+| `user_actions` | Pending/completed actions for each user (corporate action approvals, future: reminders) |
+| `symbol_fetch_tracking` | Per-symbol metadata: `first_entry_date`, `last_fetched_date`, `is_active`, `open_user_count`. Used to optimize daily sync (skip inactive symbols) and CA fetch range. |
+
+### 12b.5 Import-Time Corporate Actions (Sprint 13)
+
+When importing a historical tradebook that spans a corporate action date:
+- **Demerger**: Zero-cost entries (Zerodha CA artifacts) are filtered. Parent transaction marked consumed, children created with correct cost basis and inherited dates.
+- **Merger**: Parent marked consumed, new merged transaction created with swap ratio.
+- **Hybrid detection**: Parent transaction may already be in the DB (incremental import) — detected from DB not just the import batch.
+- **Already-applied guard**: If Sprint 12/16 already applied the CA, import only filters zero-cost entries without re-applying.
+
+---
+
+## 12c. Phase 1A — Holdings Baseline Check
+
+### 12c.1 Overview
+
+A periodic sanity check (recommended every 6-12 months) that compares the user's actual Zerodha holdings (downloaded as CSV from Zerodha Console) against NEESH's computed holdings. Any quantity shortfall (NEESH shows fewer shares than Zerodha) indicates a missing corporate action.
+
+### 12c.2 Flow
+
+```mermaid
+flowchart TD
+    Upload["Upload Zerodha Holdings CSV\nor PDF / Excel / Image via Gemini AI (Sprint 18)"]
+    Parse["Parse File\nExtract symbol + quantity per row"]
+    Compare["Compare against NEESH holdings_summary"]
+
+    subgraph results["Comparison Results"]
+        direction LR
+        OK["✅ NYKAA · Zerodha 24 · NEESH 24 · Match"]
+        Warn1["⚠️ NYKAA · Zerodha 24 · NEESH 4 · +20 missing"]
+        Warn2["⚠️ IRCTC · Zerodha 50 · NEESH 10 · +40 missing"]
+    end
+
+    Apply["One-click Apply Adjustment\nCreates bonus/split transaction\nto bridge each gap"]
+
+    Upload --> Parse --> Compare --> results
+    Warn1 --> Apply
+    Warn2 --> Apply
+```
+
+### 12c.3 Sprint 18 Enhancement
+
+Sprint 18 extends the baseline check to accept PDF, Excel, and image files (JPG/PNG screenshots of Zerodha holdings or CDSL CAS) via Gemini AI extraction, in addition to the Zerodha CSV format.
+
+---
+
+## 13. Phase 1B — Remote Access via ZROK & Cloudflare Worker
 
 ### 13.1 Overview
 
-Since the application is self-hosted on a Raspberry Pi within a home network, remote access (from outside the home) requires a secure tunnel. Cloudflare Tunnel provides this without requiring port forwarding, a static IP, or exposing the Pi directly to the internet.
+Since the application is self-hosted on a Raspberry Pi within a home network, remote access requires a secure tunnel. ZROK provides a persistent static share URL that maps to `localhost:8000` without requiring port forwarding, a static IP, or a custom domain. A Cloudflare Worker (free tier) acts as a URL registry so family members always use the same stable link regardless of Pi restarts.
 
-### 13.2 Setup Requirements
+```mermaid
+flowchart TD
+    Family["👨‍👩‍👧 Family Members\nbookmark neesh.pages.dev"]
+    Landing["Cloudflare Pages\nneesh.pages.dev\n(stable URL, never changes)"]
+    Worker["Cloudflare Worker + KV\nStores current ZROK URL\nUpdated on Pi restart"]
+    ZROK["ZROK Tunnel\nhttps://xxxxxx.share.zrok.io\n(static share URL)"]
+    Pi["Raspberry Pi 4\nFastAPI · localhost:8000"]
+    Restart["Pi Restart\nZROK reconnects\nstart_tunnel.sh notifies Worker"]
+
+    Family -->|visit| Landing
+    Landing -->|redirect to current URL| Worker
+    Worker --> ZROK --> Pi
+    Restart -.->|POST new URL| Worker
+```
+
+### 13.2 Components
 
 | Component | Detail |
 |-----------|--------|
-| **Cloudflare Account** | Free tier is sufficient |
-| **Domain** | A domain registered or transferred to Cloudflare (e.g., `wealthtracker.yourdomain.com`) |
-| **cloudflared** | Cloudflare's tunnel daemon, installed on the Raspberry Pi |
-| **Tunnel Configuration** | Maps `wealthtracker.yourdomain.com` → `localhost:8000` (FastAPI server) |
+| **ZROK** | Free self-hosted tunnel service. Provides a static share URL that persists across Pi restarts. Runs as a systemd service. |
+| **Cloudflare Worker** | Free tier. Stores current tunnel URL in Cloudflare KV. Landing page JS fetches KV value and redirects. `CLOUDFLARE_WORKER_URL` env var in `.env.prod`. |
+| **Landing Page** | Static Cloudflare Pages site. Family members bookmark this — it always redirects to the live tunnel URL. |
+| **Tunnel Notifications** | When tunnel URL changes, Pi sends notification via WhatsApp Cloud API or Email to configured users. |
 
 ### 13.3 Security Considerations
 
 | Aspect | Detail |
 |--------|--------|
-| **HTTPS** | Cloudflare provides automatic SSL/TLS termination |
-| **Authentication** | Application-level WhatsApp OTP auth (already implemented in Phase 1A) |
-| **Cloudflare Access (Optional)** | Can add an additional layer of authentication at the Cloudflare edge (e.g., email-based OTP via Cloudflare Access) for defense-in-depth |
-| **Rate Limiting** | Cloudflare provides basic rate limiting on the free tier |
-| **IP Allowlisting** | Not needed — Cloudflare Tunnel doesn't expose any ports |
+| **HTTPS** | ZROK provides automatic TLS. |
+| **Authentication** | Application-level OTP auth (WhatsApp/Email) is the primary access control. |
+| **URL Privacy** | ZROK share URL is treated as a shared secret among family members. The landing page is public but the tunnel URL in KV is not scraped (URL is opaque). |
+| **No Port Forwarding** | ZROK tunnel is outbound-only from the Pi — no inbound ports opened. |
 
 ### 13.4 Deployment
 
-- `cloudflared` runs as a systemd service on the Pi
-- Auto-starts on boot
-- Reconnects automatically on network interruption
-- Logs accessible via `journalctl`
+- `zrok share` runs as a systemd service on the Pi
+- Auto-starts on boot, reconnects on network interruption
+- `scripts/start_tunnel.sh` starts the tunnel and notifies the Cloudflare Worker of the new URL
+- Logs accessible via `journalctl -u neesh-tunnel`
 
 ---
 
@@ -1063,19 +1320,26 @@ When the AI detects a strong deviation between the user's stated strategy and it
 
 | Table | Purpose |
 |-------|---------|
-| `users` | User profiles and authentication |
+| `users` | User profiles and authentication (phone, email, role, OTP hash) |
 | `families` | Family group definitions |
 | `family_members` | Family membership and roles |
-| `holdings` | All investment holdings across all asset classes |
-| `transactions` | Buy/sell/dividend/interest transaction log |
-| `income` | Income records (all types) |
-| `loans` | Loan tracking |
-| `loan_prepayments` | Prepayment history for loans |
-| `loan_rate_changes` | Rate change log for variable rate loans |
-| `price_cache` | Cached market prices |
-| `currency_rates` | Historical and current forex rates (RBI) |
-| `statement_uploads` | AI import audit log |
+| `holdings` | All investment holdings across all asset classes (includes `isin` for equity) |
+| `transactions` | Buy/sell/dividend/interest/bonus/split transaction log (includes `isin`, `extra_data` JSON for CA metadata, `source`) |
+| `income` | Income records (salary, dividends, interest, capital gains, etc.) |
+| `loans` | Loan tracking (schema exists, UI deferred to Phase 2) |
+| `loan_prepayments` | Prepayment history for loans (Phase 2) |
+| `loan_rate_changes` | Rate change log for variable rate loans (Phase 2) |
+| `price_cache` | Cached market prices (symbol, asset_class, price, fetched_at, source) |
+| `currency_rates` | Historical and current forex rates (RBI). Historical rates cached permanently. |
+| `statement_uploads` | AI import audit log (status, extracted JSON, verification notes) |
 | `zerodha_connections` | OAuth tokens for Kite Connect |
+| `corporate_actions` | CA records fetched from NSE (symbol, isin, action_type, ex_date, ratio, metadata JSON) |
+| `user_actions` | Pending/completed user actions (corporate action approvals, future: reminders) |
+| `symbol_fetch_tracking` | Per-symbol CA fetch metadata (first_entry_date, last_fetched_date, is_active, open_user_count) |
+| `audit_log` | All write operations across all users (admin-visible) |
+| `net_worth` | Historical net worth snapshots (for net worth over time chart) |
+| `recurring` | Recurring income/transaction schedules (salary, SIP, RD, PPF) |
+| `tunnel_url` | Current tunnel URL for Cloudflare Worker sync |
 | `expense_sheet_config` | Google Sheet links and sync status (Phase 2) |
 | `expenses` | Expense records (Phase 2) |
 
@@ -1154,12 +1418,13 @@ Each asset class carries its own tax rule configuration that can be updated inde
 
 | Aspect | Detail |
 |--------|--------|
-| **Authentication** | WhatsApp OTP — no passwords stored |
+| **Authentication** | OTP-based (no passwords stored). Delivered via WhatsApp Cloud API, Email SMTP, or console fallback. |
 | **Session Management** | JWT with configurable expiry |
-| **Data at Rest** | SQLite file on encrypted volume (LUKS recommended) |
-| **Data in Transit** | HTTPS via Cloudflare (Phase 1B). HTTP on local network (acceptable for home use) |
-| **API Keys** | Stored in environment variables or a `.env` file (not in code) |
-| **Zerodha Tokens** | Encrypted before storage in SQLite |
+| **Data at Rest** | SQLite file — LUKS full-disk encryption recommended on Pi for local security. Google Drive backups are AES-256 encrypted before upload. |
+| **Data in Transit** | HTTPS via ZROK tunnel (Phase 1B). HTTP on local network (acceptable for home use). |
+| **API Keys** | Stored in environment-specific `.env` files (not in code). Separate `.env.prod`, `.env.dev`, `.env.test`. |
+| **Zerodha Tokens** | Stored in database; token refresh handled on expiry. |
+| **Audit Trail** | All write operations logged to `audit_log` table. Admin-only visibility. |
 
 ### 20.4 Maintainability
 
@@ -1177,13 +1442,15 @@ Each asset class carries its own tax rule configuration that can be updated inde
 
 | Risk | Impact | Likelihood | Mitigation |
 |------|--------|------------|------------|
-| **Gemini Free Tier rate limits** | Statement parsing failures | Medium | Batch processing, retry with backoff, manual entry as fallback |
-| **yfinance API instability** | Stale price data | Medium | Google Finance fallback, AMFI API for MFs, cached prices with staleness indicator |
-| **Zerodha Kite API changes** | Integration breakage | Low | CSV upload fallback, API version pinning |
-| **Raspberry Pi SD card failure** | Data loss | Medium | Weekly backups to USB drive, optional cloud sync, use SSD instead of SD card |
+| **Gemini API rate limits / quota exhaustion** | Statement parsing failures | Medium | Multiple API key rotation (`GEMINI_API_KEYS`), retry with backoff via `robust_llm_call()`, LiteLLM fallback, local parser for known formats |
+| **yfinance API instability** | Stale price data | Medium | AMFI API for MFs, cached prices with staleness indicator on dashboard |
+| **NSE corporate actions API changes** | CA detection failures | Medium | CAs are user-approved before apply — worst case is no notification, not silent data corruption. Manual entry fallback. |
+| **Zerodha Kite API changes** | Integration breakage | Low | CSV upload is the primary import path; Kite API is an enhancement. Format changes handled by local parser updates. |
+| **Raspberry Pi hardware failure** | Data loss | Medium | Weekly local backup + monthly Google Drive backup (AES-256 encrypted). Recovery = decompress + copy. |
 | **SQLite concurrent write contention** | Slow writes under load | Low | WAL mode, max 5 concurrent users, write operations are infrequent |
-| **Twilio WhatsApp API costs** | OTP cost at scale | Low | 15 users max, very low OTP volume. Consider self-hosted WhatsApp Business API if costs rise |
+| **WhatsApp Cloud API availability** | OTP delivery failure | Low | Email SMTP fallback, then console fallback. Users can also be notified to check email. |
 | **Tax law changes** | Incorrect tax classification | Yearly | Per-asset-class tax config (Section 19) — update only affected class |
+| **Historical CA coverage gaps** | Missing old CA detection | Low | Holdings Baseline Check (Section 12c) provides a manual catch-all for any quantity discrepancies |
 | **Google Sheets format change** | Expense sync failure (Phase 2) | Low | Fixed column format agreement, validation on import |
 | **RBI rate API unavailability** | Missing conversion rates | Low | Cache historical rates permanently, manual entry fallback |
 | **50-60 year data lifespan** | Schema evolution, SQLite limits | Long-term | Alembic migrations, SQLite supports up to 281 TB databases. If needed, migrate to PostgreSQL in future |
