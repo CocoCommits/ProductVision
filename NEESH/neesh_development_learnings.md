@@ -453,6 +453,225 @@ SELECT * FROM holdings_summary;
 
 ---
 
+## Part 10 — Corporate Actions: The Feature That Rewrites Everything
+
+Corporate actions — stock splits, bonus issues, demergers, mergers, symbol changes — are the hardest thing in equities-based finance software. They are not edge cases. They are common. And if you get them wrong, every holding calculation, every XIRR computation, every tax classification is wrong.
+
+I didn't appreciate the full scope until I tried to answer a simple question: *"If I import 5 years of my Zerodha tradebook, will my holdings be accurate?"*
+
+The answer: *"Only if you also handle every corporate action that occurred during those 5 years, in the right order, with the right math."*
+
+### The Data Source Decision
+
+Three options were on the table: NSE Corporate Actions API, third-party aggregators (Screener, Investing.com), or manual curation by admin.
+
+NSE was the right choice. It's the authoritative source, it's free, and it covers bonus, split, merger, and symbol change — everything relevant. The tricky part is the request headers: NSE requires `Referer: https://www.nseindia.com/` and a proper User-Agent. Without these, the API silently blocks responses. Once that was understood, the integration was straightforward.
+
+Dividends were excluded from auto-detection — they come through Zerodha's dividend CSV. Rights issues were excluded — they require a user decision (subscribe or not). Everything else is auto-detectable.
+
+> **When building financial software, always use the authoritative data source. Third-party aggregators are convenient until they aren't.**
+
+### Why Corporate Actions Must Be User-Approved
+
+The first design question: should the system auto-apply detected corporate actions?
+
+The answer is no. The reasoning matters.
+
+Auto-applying a 5:1 bonus looks correct in the holdings summary — but what if the NSE API returned the wrong ratio? What if there was a symbol collision and the action got applied to the wrong holding? In a financial system, silent mutations are catastrophic. They produce wrong averages, wrong XIRR, wrong tax classifications — all with no visible indication that anything changed.
+
+The design: NSE sync runs at 6:00 AM IST daily → detects actions matching user holdings → creates a pending `UserAction` → user reviews and approves → system applies. Consumed transactions are soft-marked (not deleted), preserving the audit trail.
+
+Building a dedicated Actions & Notifications area in the app (with a badge count in the nav) was an investment in the future. Corporate action approvals, import warnings, reconciliation alerts — all flow through the same generic `UserAction` system. Adding a new action type costs nothing in UI.
+
+> **In financial software, no system should silently mutate data. Make every significant change visible, explicit, and reversible.**
+
+### The Import Problem I Didn't See Coming
+
+Zerodha's tradebook includes zero-cost entries for demerger allocations:
+
+```
+2025-10-14, TMLCV, 1000, 0, buy    ← not a purchase — demerger allocation
+2025-10-14, TMLPV, 1000, 0, buy    ← same
+```
+
+These are shares received when TATA Motors demerged its commercial vehicle division. The buy price is zero because the cost basis comes from the original TATAMOTORS holding, not a fresh purchase.
+
+Without specific handling: these import as garbage transactions with zero cost basis — completely wrong for tax. The TMLCV/TMLPV holdings have no valid cost, XIRR calculations become meaningless, and the user has no idea anything went wrong.
+
+The import review flow needs to detect these patterns. And that's where the design got complicated.
+
+### Staged Import: Why Chronological Order Is Mandatory
+
+The natural instinct for importing 5 years of data: break it up year by year. Smaller files, easier to review.
+
+This instinct is wrong.
+
+Demerger detection needs to find the *parent* transaction and the *child* transaction together. The TATAMOTORS buy was in 2022. The TMLCV demerger entries appear in 2025.
+
+With year-by-year import:
+- 2022 batch: TATAMOTORS buy stored in DB ✓
+- 2025 batch: TMLCV zero-cost entries — parent NOT in batch, detection fails, garbage imported ✗
+
+**The only safe approach for initial historical backfill: import the full multi-year file as a single batch, chronologically.** File size is not a practical concern — 4-5 years of active trading is typically 500-3000 CSV rows, well under 500KB.
+
+> **For financial data import, completeness beats convenience. One clean chronological import beats multiple partial ones.**
+
+After the initial import, incremental imports are safe — the hybrid detection pattern (below) handles edge cases, and historical holdings already have correct cost basis.
+
+### Hybrid Detection: Making Incremental Imports Safe
+
+Six months after the initial import, you import a new batch. The batch contains TMLCV zero-cost entries. The parent TATAMOTORS buy is in the DB — not in this batch. Without modification, detection fails exactly as with the year-wise problem.
+
+The fix: **hybrid detection** — check both the import batch AND the existing DB for parent symbols. If not found in the batch, query the DB. If found in the DB, use it to construct the correct transformation.
+
+A companion guard prevents double-application: before any transformation, check whether the CA is already applied (marked with `from_demerger`). If already applied, just filter the zero-cost entries — don't re-transform.
+
+This makes the import system both forward-looking (full batch detection for historical imports) and backward-looking (DB lookup for incremental imports). These patterns together mean that regardless of when and how a user imports data, corporate action handling is correct.
+
+### Symbol Fetch Tracking: A Cross-User Cache
+
+Corporate action data is market-wide — not per-user. If RELIANCE splits, it affects every user holding it. Fetching CA data separately per user is wasteful and inconsistent.
+
+The solution: a `symbol_fetch_tracking` table, shared across all users, with four key fields:
+
+| Field | Purpose |
+|-------|---------|
+| `first_entry_date` | Earliest transaction date across ALL users — determines CA fetch range start |
+| `last_fetched_date` | CA data fetched up to this date — determines the gap to fetch next |
+| `is_active` | Whether any user has an open position (false = skip daily sync) |
+| `open_user_count` | Number of users currently holding this symbol |
+
+Fetch logic on import:
+1. If symbol not tracked: fetch NSE CA from `batch_start` → today; insert tracking record
+2. If tracked but stale: fetch only from `last_fetched_date` → today
+3. If tracked and current: skip NSE call entirely; use DB cache
+
+The second user to import a symbol pays zero NSE API cost for historical data. After 6 months of daily syncs, an incremental import typically makes zero NSE calls at all.
+
+> **When data is market-wide (not per-user), maintain it at the system level. Shared cache beats per-user redundancy.**
+
+The cleanup inverse: a weekly job marks symbols `is_active = FALSE` when every user's position in that symbol is closed. The daily sync skips inactive symbols. Stale CA rows are pruned. As the user base grows, sync time stays bounded by active positions, not historical ones.
+
+**Edge case — re-buying a closed symbol:** Re-activation checks `last_fetched_date` and backfills only the gap since it went inactive. The full history is already in the DB from before.
+
+### CA Ordering Enforcement: A Correctness Problem
+
+If a user has three pending corporate actions for POWERGRID — 2021 bonus, 2022 bonus, 2023 bonus — and applies the 2023 one first, every quantity and average price calculation is wrong.
+
+I initially assumed visual ordering on the Actions page (sorted by ex_date) would be sufficient. It wasn't. Users don't read sort orders. The UI doesn't prevent out-of-order application. The consequences are invisible — the numbers look plausible but are wrong.
+
+The correct solution has two mandatory parts:
+
+1. **Server-side guard**: before applying any CA, check if earlier unapplied CAs exist for the same symbol. If yes, reject with a specific error — "Apply POWERGRID 2021-07-29 first." The server-side guard is non-negotiable.
+2. **UI enforcement**: disable the Apply button with a tooltip. Make the ordering constraint visible, not just enforced.
+
+> **Correctness constraints belong on the server, not just the UI. The UI can be bypassed. The server guard cannot.**
+
+---
+
+## Part 11 — Import Edge Cases: The Math Behind the Corner Cases
+
+### Sell Exceeding Holdings During Import
+
+User buys 10 IRCTC. Stock splits 5:1 (not yet applied). User sells 40 post-split. During import: buy 10 → holding 10, sell 40 → rejected (40 > 10).
+
+The correct behaviour: **skip sell validation during import, import anyway.**
+
+The broker executed the trade. The tradebook is ground truth. The "impossible" sell happened because a corporate action that hasn't been applied yet changes the math. Once the split is applied (10 → 50), the sell is valid (50 - 40 = 10).
+
+Blocking the import is wrong. Silently importing without notification is also wrong. The right design: import with a warning, create a `UserAction` with `action_type = "import_warning"`. This surfaces in the Actions & Notifications area with the same badge system used for corporate actions. The user sees it, applies the split, and the holding corrects automatically — no re-import needed.
+
+The import warning integrates into the existing system at zero UI cost. And it makes the problem actionable rather than invisible.
+
+### The Deleted-Holding Edge Case
+
+A variant: the sell is large enough that `holding = buy - sell < 0`. NEESH cleans up zero/negative holdings — the summary record is deleted.
+
+The corporate action reconciliation scan only checks symbols with `total_quantity > 0`. So if NYKAA's holding was deleted (buy 8, split 5:1 unapplied, sell 40 → holding goes negative), it never appears in the scan. The relevant bonus/split notification is never generated. The user can't fix what they can't see.
+
+Fix: the reconciliation scan must also include symbols that have a pending `import_warning` UserAction, regardless of holdings state. CA detection cannot depend on holdings summary existence.
+
+### Fractional Shares: Truncation Is Permanent
+
+Applying a 5:2 split to 5 shares: 5 × 2.5 = 12.5. The broker floors to 12. The 0.5 fractional share is paid as cash to the bank account — and is **permanently gone**.
+
+This is not rounding. It is truncation with a side effect. And it compounds across subsequent actions: the next CA applies to 12 shares, not 12.5. The fractional remainder does not carry forward.
+
+The implementation must:
+1. Use `int(quantity * ratio)` for resulting share counts — never round, always floor
+2. Compute the cash payout for the fractional remainder (display only, not stored as a transaction)
+3. Use the floored integer as the input to any subsequent CA calculation
+
+### The Ex-Date Rule: Strict `<`, Not `<=`
+
+The ex-date is when the stock price adjusts down to reflect the bonus or split. To receive the bonus shares, you must buy **before** the ex-date.
+
+Buy **on** the ex-date: you pay the post-adjustment price but receive no extra shares. It looks like a good deal. It isn't — you simply paid the adjusted price.
+
+```python
+# WRONG — includes buyers on ex_date
+qty_held = sum(t.quantity for t in buys if t.date <= ex_date)
+
+# CORRECT — excludes buyers on ex_date
+qty_held = sum(t.quantity for t in buys if t.date < ex_date)
+```
+
+This single character difference (`<=` vs `<`) changes which lots are eligible for every corporate action calculation.
+
+### Real-World Verification: VBL
+
+All of the above came together in a real-world verification exercise using VBL (Varun Beverages) holdings.
+
+VBL had four corporate actions between 2021 and 2024: bonus 1:2 (2021-06-10), bonus 1:2 (2022-06-06), split 1:2 (2023-06-15), split 2:5 (2024-09-12).
+
+A holding bought on exactly the 2021-06-10 ex-date correctly received:
+- Zero shares from the 2021 bonus (bought ON ex_date — not eligible)
+- 3 shares from the 2022 bonus (7 × 1/2 = 3.5 → floored to 3, cash for 0.5)
+- 2× from the 2023 split
+- 2.5× from the 2024 split — 20 × 2.5 = 50 shares, no fractional this lot
+
+Final quantity matched Zerodha's holdings statement exactly. That match — not just "the tests pass" but "the numbers agree with the broker to the share" — is what correct CA implementation looks like.
+
+> **Financial rules have precise edge cases. Verify corporate action logic against real broker data before trusting it. "Tests pass" and "matches the broker" are different bars.**
+
+---
+
+## Part 12 — Small Things That Bite
+
+### CSV Space Stripping
+
+CSV files can have leading or trailing whitespace in values — not in headers, but in the actual data cells. A ratio stored as `" 1:2"` fails integer parsing. A symbol stored as `" HDFCBANK"` mismatches holdings lookups silently.
+
+The parser normalised keys (`.strip()`) but not values. The fix is universal: strip all values at the point of CSV ingestion, not per-field. This is the kind of bug that never shows up in tests (which use clean fixture data) and always shows up in production (which uses real broker files).
+
+> **Data coming from external sources is not clean. Normalise at the boundary, every time.**
+
+### Family Transaction View: One Table, Not Tabs
+
+When designing the family transaction history view, the first instinct was per-member tabs — one tab per family member.
+
+The right design: a "Select user(s)" dropdown with a single unified table. A "User" column appears only when multiple members are selected.
+
+Reasons:
+- Per-member tabs mean 3-5 separate page loads to review all family activity — more friction
+- A combined view lets you see cross-family patterns ("show all equity buys in Q1 2024") — genuinely more useful
+- Simpler implementation: one route change, one query change, one template column
+
+The load concern (querying multiple users' data) is irrelevant for a family app with 3-5 members and a few hundred transactions each.
+
+> **UI decisions driven by "what if it's slow" before measuring anything are premature. Load is usually not the bottleneck.**
+
+### AI Parser Consolidation
+
+The import pipeline started with separate parser classes per asset class, each with duplicated base logic. Consolidating to a single base parser with per-class prompt customisation and validation rules:
+- Reduces code surface area
+- Centralises retry logic, JSON validation, and error handling
+- Means any improvement to the AI call layer benefits all asset classes at once
+
+The key insight: the AI extraction step is the same for every asset class — parse this file, return structured JSON. What differs is the prompt (what fields to extract) and the validation (what makes a valid transaction for this class). Separate those concerns; keep the infrastructure common.
+
+---
+
 ## Part 8 — The Consolidated Playbook
 
 ### On Planning
@@ -472,6 +691,8 @@ SELECT * FROM holdings_summary;
 - Schema changes through Alembic migrations. Always. No manual `ALTER TABLE`.
 - JSON columns are for display-only data. Anything queryable gets a proper column.
 - Holdings summary is a rebuildable cache. Drop it, recompute from transactions, lose nothing.
+- Cross-cutting data (e.g., market-wide CA tracking) belongs at the system level, not duplicated per-user.
+- Generic action/notification platforms (with badges and action types) cost the same to build as specific ones — and support every future use case for free.
 
 ### On Development
 - Break large sprints when reality exceeds the plan.
@@ -480,6 +701,11 @@ SELECT * FROM holdings_summary;
 - Separate databases, ports, and cleanup scripts for dev vs. test.
 - Both test and code can be wrong — question both. Fix the underlying logic, not just what makes the test pass.
 - Scripts over manual steps. Reduces cognitive load, prevents errors, handles environment differences.
+- Financial rule edge cases (ex-date eligibility, fractional share truncation) must be verified against real broker data, not just unit tests.
+- Correctness constraints (like CA ordering) belong on the server, not just the UI. The UI can be bypassed; the server cannot.
+- When importing financial data, broker statements are ground truth. Never block an import because the data looks impossible — it may be correct data with a missing corporate action.
+- For initial historical data import, completeness beats convenience. One clean chronological import beats multiple partial ones.
+- Normalise external data (CSV values, API responses) at the boundary — strip spaces, validate types before they touch any business logic.
 
 ### On AI Collaboration
 - Documents are the source of truth, not conversations.

@@ -57,9 +57,10 @@ The entire stack — web server, background jobs, database — runs in a **singl
 
 ```mermaid
 flowchart TB
-    subgraph phase1["✅ Phase 1 — COMPLETE"]
+    subgraph phase1["✅ Phase 1 (Sprints 0–17 Done · Sprint 18 In Progress)"]
         direction LR
         A["📊 11 Asset Classes"] ~~~ B["💰 Income Tracking"] ~~~ C["🤖 AI Import"] ~~~ D["📈 Live Market Data"] ~~~ E["👨‍👩‍👧‍👦 Family Accounts"] ~~~ F["🔐 Admin & Auth"]
+        G["🏛️ Corporate Actions"] ~~~ H["🌐 Remote Access"] ~~~ I["💾 Backup & Restore"]
     end
 
     subgraph phase2["📋 Phase 2 — PLANNED"]
@@ -199,7 +200,7 @@ flowchart TB
         Services["Service Layer\n(All Business Logic)"]
         Repos["Repositories\n(Database Access)"]
         Jobs["APScheduler\n(Background Jobs)"]
-        AI["AI Module\n(Gemini Client)"]
+        AI["AI Module\n(Local Parser → Gemini → LiteLLM)"]
         Market["Market Data\n(yfinance, AMFI, RBI)"]
     end
 
@@ -212,8 +213,12 @@ flowchart TB
         YF["yfinance"]
         AMFI_API["AMFI NAV"]
         RBI["RBI Rates"]
-        Twilio["Twilio (OTP)"]
+        WA["WhatsApp Cloud API\n(OTP primary)"]
+        SMTP["Email SMTP\n(OTP fallback)"]
         Zerodha["Zerodha Kite"]
+        GDrive["Google Drive\n(encrypted backup)"]
+        NSE_CA["NSE CA API\n(corporate actions)"]
+        ZROK["ZROK + Cloudflare Worker\n(remote access tunnel)"]
     end
 
     UI <--> Routes
@@ -439,15 +444,195 @@ XIRR is computed using `pyxirr` (Rust-based, 100× faster than scipy). Returns a
 
 ---
 
+<details>
+<summary><h3>Corporate Actions — Detection, Approval, and Application</h3></summary>
+
+The NSE CA API is queried daily at 6:00 AM IST for five action types: **bonus**, **split**, **demerger**, **merger**, and **symbol change**. Detected actions are matched to user holdings and surfaced for explicit user approval — nothing is auto-applied.
+
+```mermaid
+flowchart TB
+    NSESync["NSE CA API\n(daily sync 6:00 AM IST)"]
+    Fetch["Fetch: bonus · split\ndemerger · merger · symbol change"]
+    SymMatch{"Matches any\nuser holding?"}
+    NoMatch["Skip — no users affected"]
+    DupeCheck{"Already\napplied?"}
+    NewUA["Create pending UserAction\n(one per user per CA)"]
+    NavBadge["🔔 Nav badge updates\n(pending count)"]
+    ActionsPage["User opens Actions & Notifications\n(sorted: symbol → ex_date, oldest first)"]
+    OrderCheck{"Earlier unapplied CA\nfor same symbol?"}
+    Blocked["⛔ Apply button disabled\nTooltip shows which CA must go first"]
+    ApplyBtn["User clicks Apply"]
+    ServerGuard["Server-side ordering check\n(guard cannot be bypassed via UI)"]
+    ApplyOp["Apply CA:\nUpdate transaction quantities\nInherit cost basis from parent"]
+    SoftMark["Soft-mark consumed transactions\n(not deleted — audit trail preserved)"]
+    Recompute["Recompute holdings_summary"]
+    Done["✅ Holding updated\nQty · avg price · XIRR recalculated"]
+    Dismiss["User clicks Dismiss\n(CA rejected — no change to holdings)"]
+
+    NSESync --> Fetch --> SymMatch
+    SymMatch -->|"No match"| NoMatch
+    SymMatch -->|"Matched"| DupeCheck
+    DupeCheck -->|"Already applied"| NoMatch
+    DupeCheck -->|"New"| NewUA --> NavBadge --> ActionsPage
+    ActionsPage --> OrderCheck
+    OrderCheck -->|"Earlier pending"| Blocked
+    OrderCheck -->|"Clear"| ApplyBtn --> ServerGuard --> ApplyOp --> SoftMark --> Recompute --> Done
+    ActionsPage --> Dismiss
+```
+
+| CA Type | Effect on Holdings | Zerodha Tradebook Entry |
+|:--------|:------------------|:------------------------|
+| **Bonus** | New shares at zero cost; avg price dilutes | Zero-price buy entry |
+| **Split** | Qty × ratio; face value divides | No separate buy — quantities updated |
+| **Symbol Change** | All transactions migrated to new symbol | Old symbol retired in DB |
+| **Demerger** | Child company shares created; parent unchanged | Zero-price buy for child symbol |
+| **Merger** | Target shares swapped for acquirer shares | Target transactions marked consumed |
+
+**Import-time CA detection** — Zerodha tradebook already contains CA-derived entries (zero-cost demerger allocations, post-split sell volumes that exceed pre-split holdings). The import pipeline detects and handles these before committing:
+
+```mermaid
+flowchart TB
+    Upload["Upload tradebook\n(CSV / Excel)"]
+    Scan["Scan for CA indicators:\nzero-cost buys · sells exceeding holdings"]
+    HybridSearch{"Parent symbol found\nin batch or existing DB?"}
+    Transform["Inherit cost basis from parent\nCreate CA-correct transactions"]
+    SellExceeds["Sell qty exceeds available holding\n(CA not yet applied)"]
+    ImportWarn["Create import_warning UserAction\n(visible on Actions page with badge)"]
+    ReviewPage["Import review page\n(CA detections and warnings listed)"]
+    Commit["User confirms → transactions saved"]
+
+    Upload --> Scan --> HybridSearch
+    HybridSearch -->|"Found"| Transform --> ReviewPage
+    HybridSearch -->|"Not found"| SellExceeds --> ImportWarn --> ReviewPage
+    ReviewPage --> Commit
+```
+
+**CA math rules:**
+- **Ex-date eligibility**: buy date must be strictly `<` ex_date — buying *on* the ex_date means you paid the adjusted price but receive no extra shares
+- **Fractional shares**: quantities are always floored (`int(qty × ratio)`); the decimal remainder is paid as cash by the broker and does **not** carry forward to future CA calculations
+- **Ordering**: CAs for the same symbol must be applied chronologically; the server enforces this regardless of UI state
+
+</details>
+
+---
+
+<details>
+<summary><h3>Income Management — Manual, Auto-Generated, and FY Views</h3></summary>
+
+Income flows from three sources: manual entries, automatic creation triggered by transactions, and a background job for recurring schedules.
+
+```mermaid
+flowchart TB
+    subgraph Manual["Manual Income Entry"]
+        Sal["Salary · Bonus\n(one-time or recurring)"]
+        Free["Freelance · Rental · Other\n(any source with optional TDS)"]
+    end
+
+    subgraph AutoCreate["Auto-Created from Transactions"]
+        DivTxn["Dividend transaction\non direct_equity holding"]
+        FDInt["FD interest payout\n(non-cumulative FDs)"]
+        SGBCoup["SGB coupon payment\n(2.5% p.a., semi-annual)"]
+        RSUPerq["RSU vest event\nPerquisite = FMV × qty × FX rate"]
+    end
+
+    subgraph RecurringJob["Recurring (Daily Background Job)"]
+        RecSal["Scheduled salary entry\n(generates on due date)"]
+        RecIntAccr["FD interest accrual\n(cumulative FDs — computed daily)"]
+    end
+
+    IncTable[("income table\nsource · type · amount\ntds_amount · financial_year")]
+
+    subgraph FYDashboard["Financial Year View (Apr–Mar)"]
+        FYBreak["Income by category\nsalary · dividends · interest · other"]
+        TDSSumm["TDS credited by deductors\nvs. gross income"]
+        NetInc["Net income = gross − TDS"]
+    end
+
+    Manual --> IncTable
+    AutoCreate -->|"auto-creates entry\n(no double-entry)"| IncTable
+    RecurringJob --> IncTable
+    IncTable --> FYDashboard
+```
+
+**No double-entry:** when a dividend transaction is recorded on a holding, the income entry is created automatically. The user never enters dividend income separately.
+
+| Income Source | Auto-Created? | TDS Applicable | Notes |
+|:-------------|:-------------|:--------------|:------|
+| Salary / Bonus | No (manual or recurring) | Yes | Employer TDS stored per entry |
+| FD Interest | Yes (from FD transaction) | Yes (10% above ₹40K) | Auto-recorded on payout or accrual |
+| Dividends | Yes (from equity transaction) | Yes (10% above ₹5K) | Single entry auto-created |
+| SGB Coupon | Yes (background job) | No | Semi-annual, auto-scheduled |
+| RSU Perquisite | Yes (on vest event) | Yes (employer TDS) | FX-converted to INR at vest date |
+| Freelance / Rental | No (manual) | Depends | Optional TDS field |
+
+**TDS tracking** is per-entry — each income record stores gross amount and TDS separately. The FY dashboard aggregates both so users can reconcile against Form 26AS: how much was deducted by employers/banks vs. how much is still owed.
+
+</details>
+
+---
+
+<details>
+<summary><h3>Admin Dashboard</h3></summary>
+
+The first registered user is automatically assigned the Admin role. Admins have system-wide visibility across all users and families, with a dedicated panel for operations, audit, and data integrity.
+
+```mermaid
+flowchart TB
+    AdminPanel["🔑 Admin Panel\n(system-wide access, bypasses family scope)"]
+
+    subgraph UserAdmin["User & Family Management"]
+        AllUsers["View all registered users\nacross all families"]
+        RoleMgmt["Assign / change roles\nadmin · owner · editor · viewer"]
+        WriteToggle["Toggle write access\n(per user or system-wide lock)"]
+        FamilyMgmt["View and manage all families\n(members, roles, combined data)"]
+    end
+
+    subgraph AuditOps["Audit & Monitoring"]
+        AuditLog["Audit log viewer\nall write operations with user + timestamp"]
+        SysHealth["System health check\nDB status · job schedules · API connectivity"]
+    end
+
+    subgraph BackupOps["Backup Operations"]
+        BackupNow["On-demand backup\n(local + Google Drive)"]
+        BackupHistory["Backup history\ndate · size · SHA-256 checksum"]
+    end
+
+    subgraph OnDemandSync["On-Demand Sync"]
+        ForcePrice["Force price refresh\n(bypass 3:45 PM daily schedule)"]
+        ForceCA["Force CA sync\n(bypass 6:00 AM daily schedule)"]
+    end
+
+    subgraph DataIntegrity["Holdings Baseline Check (Sprint 17)"]
+        ZerodhaUpload["Upload Zerodha portfolio CSV\n(fresh export from Zerodha)"]
+        DiffView["Diff view:\nNEESH qty vs Zerodha qty per symbol"]
+        FixBtn["One-click fix\napply discrepancies from Zerodha"]
+    end
+
+    AdminPanel --> UserAdmin
+    AdminPanel --> AuditOps
+    AdminPanel --> BackupOps
+    AdminPanel --> OnDemandSync
+    AdminPanel --> DataIntegrity
+    ZerodhaUpload --> DiffView --> FixBtn
+```
+
+**Write access enforcement** (Sprint 9): all write operations (transaction create/edit/delete, income changes, CA applications) check a system-wide write-access flag before executing. The Admin can lock the entire system (e.g. before a backup/restore) or lock a specific user's account. All write attempts while locked are rejected at the service layer.
+
+**Holdings Baseline Check** (Sprint 17) is the end-to-end integrity check — it catches discrepancies that could arise from any combination of missed corporate actions, import errors, or manual entry mistakes. Upload today's Zerodha portfolio CSV, NEESH shows a side-by-side quantity comparison per symbol, and offers a one-click fix for any gaps.
+
+</details>
+
+---
+
 <a name="ai-powered-import"></a>
 
 ## 🤖 AI-Powered Import
 
-Manually entering every transaction is a non-starter when you have years of investment history. NEESH uses a **three-tier parsing pipeline** to extract transactions from broker statements.
+Manually entering every transaction is a non-starter when you have years of investment history. NEESH uses a **three-tier parsing pipeline** with a LiteLLM fallback to extract transactions from broker statements.
 
 ```mermaid
 flowchart LR
-    Upload["📄 Upload\nCSV / Excel"]
+    Upload["📄 Upload\nCSV / Excel / PDF / Image"]
 
     Upload --> T1
 
@@ -456,29 +641,34 @@ flowchart LR
         T1["🔧 Tier 1\nLocal Regex Parser\n(known formats)"]
         T2["⚡ Tier 2\nGemini Flash\n(extraction)"]
         T3["🧠 Tier 3\nGemini Pro\n(verification)"]
+        T4["🔁 Fallback\nLiteLLM\n(OpenAI-compatible)"]
     end
 
     T1 -->|"Unknown format"| T2
     T2 -->|"Extracted JSON"| T3
+    T2 -->|"Gemini unavailable"| T4
     T1 -->|"Parsed ✅"| Review
     T3 -->|"Verified ✅"| Review
+    T4 -->|"Extracted JSON"| Review
 
     Review["👤 User Review\n& Confirm"]
 
     style T1 fill:#10b981,color:#fff
     style T2 fill:#3b82f6,color:#fff
     style T3 fill:#8b5cf6,color:#fff
+    style T4 fill:#f59e0b,color:#fff
 ```
 
 | Tier | Engine | Purpose | Speed |
 |:-----|:-------|:--------|:------|
-| **Tier 1** | Regex parser | Known formats (Zerodha, CAMS, NSDL) | Instant |
+| **Tier 1** | Regex parser | Known formats (Zerodha, CAMS, NSDL) — zero API cost | Instant |
 | **Tier 2** | Gemini Flash | Extract structured data from unknown formats | ~2-3 sec |
 | **Tier 3** | Gemini Pro | Re-verify extracted data for accuracy | ~5 sec |
+| **Fallback** | LiteLLM | OpenAI-compatible endpoint when Gemini is unavailable | ~2-5 sec |
 
-**Why two AI models?** Flash is fast and great at structured extraction. Pro is slower but catches reasoning errors — wrong date formats, misidentified transaction types, currency confusion. The verification step catches ~15% of extraction errors.
+**Why multiple tiers?** The local parser handles known formats at zero cost. Flash is fast and great at structured extraction from unknown formats. Pro catches reasoning errors — wrong date formats, misidentified transaction types, currency confusion (~15% of extraction errors). LiteLLM is the fallback when Gemini is unavailable or rate-limited (e.g. using an internal corporate gateway).
 
-Files are parsed locally first (openpyxl/csv) and sent as text to Gemini — never as binary files. This avoids Gemini's File API quotas and works reliably.
+Excel and CSV files are parsed locally first (openpyxl/csv) and sent as text to Gemini — avoiding File API quotas. Images (JPG/PNG) are sent directly to Gemini Vision (Sprint 18).
 
 ---
 
@@ -528,22 +718,29 @@ The **Admin** role sits above families — system-wide access for user managemen
 
 ## 🗺️ Roadmap
 
-### Phase 1 — Complete ✅
-
-Delivered across 10 sprints:
+### Phase 1  Done ·
 
 | Sprint | Deliverable |
 |:-------|:-----------|
-| Sprint 0 | Project bootstrap — models, auth, database, health checks |
-| Sprint 1 | Authentication — WhatsApp OTP, JWT tokens, dev mode login |
-| Sprint 2 | Transactions — CRUD for all 11 asset classes, holdings computation |
-| Sprint 3 | Market Data — yfinance integration, AMFI NAV, RBI rates, price caching |
-| Sprint 4 | Dashboard — net worth charts, asset allocation, P&L visualization |
-| Sprint 5 | AI Import — local parser + Gemini Flash/Pro pipeline |
-| Sprint 6 | Income Tracking — manual entry, auto-income from dividends/interest, TDS |
-| Sprint 7 | Family Accounts — groups, permissions, combined dashboards |
-| Sprint 8 | Zerodha Integration — OAuth flow, portfolio sync (planned) |
-| Sprint 9 | Admin Panel — user management, audit logging, write access controls |
+| Sprint 0 | Project setup, auth base, models, health check |
+| Sprint 1 | Registration (phone/name/DOB), WhatsApp OTP, JWT |
+| Sprint 2 | Transaction CRUD, holdings computation, tax classification |
+| Sprint 3 | Market data pipeline (yfinance, AMFI NAV, RBI rates) |
+| Sprint 4 | Dashboard with Chart.js, net worth, XIRR, snapshots |
+| Sprint 5 | AI Import Pipeline (local parser + Gemini + LiteLLM) |
+| Sprint 6 | Income Tracking (salary, dividends, auto-interest, TDS, recurring) |
+| Sprint 7 | Family Accounts (three-tier permissions, combined dashboard) |
+| Sprint 8 | Settings page, Zerodha Kite Connect OAuth, CSV fallback |
+| Sprint 9 | Admin Panel, audit logging, write access enforcement |
+| Sprint 10 | Remote Access (ZROK static URL + Cloudflare Worker) |
+| Sprint 11 | Email OTP Authentication (WhatsApp → Email → Console priority) |
+| Sprint 12 | Corporate Actions Auto-Detection (NSE daily sync, bonus/split) |
+| Sprint 13 | Demergers & Mergers (cost-basis splitting, merger swap ratios) |
+| Sprint 14 | Symbol Fetch Tracking & CA cleanup (daily sync optimization) |
+| Sprint 15 | Secure Backup (local + Google Drive + on-demand from admin) |
+| Sprint 16 | Historical CA Reconciliation (full NSE history, ⚠️ indicators) |
+| Sprint 17 | Holdings Baseline Check (Zerodha CSV vs NEESH, one-click fix) |
+| Sprint 18 | AI-Powered Holdings & Salary Import — **In Progress** |
 
 ### Phase 2 — Planned
 
@@ -636,7 +833,7 @@ flowchart LR
 
 Reuses existing infrastructure:
 - Gemini client (same module, different prompts)
-- Twilio (same credentials, WhatsApp notifications instead of OTP)
+- WhatsApp Cloud API (same integration, strategy deviation alerts instead of OTP)
 - yfinance (extended with `get_technical_indicators()`)
 
 </details>
@@ -672,7 +869,17 @@ HTMX gives us dynamic interactions (partial page updates, inline editing, async 
 <details>
 <summary><b>Why single process (no Celery, no Redis)?</b></summary>
 
-Our "background job" load is: refresh prices once a day, refresh forex rates once a day, take a net worth snapshot, and check a weekly backup. That's 3-4 jobs per day.
+Seven background jobs cover all scheduled work:
+
+| Job | Schedule | What It Does |
+|:----|:---------|:------------|
+| Price refresh | Daily 3:45 PM IST | Update all held instruments from yfinance/AMFI |
+| Corporate actions sync | Daily 6:00 AM IST | Fetch NSE CA data, match to user holdings |
+| Recurring income | Daily | Generate scheduled salary/dividend/interest entries |
+| Recurring transactions | Daily | Generate scheduled SIP/RD/PPF transactions |
+| Symbol cleanup | Weekly | Mark closed positions inactive, prune stale CA rows |
+| Local backup | Weekly | Compressed SQLite snapshot with retention policy |
+| Google Drive backup | Monthly | AES-256 encrypted backup to Google Drive |
 
 APScheduler's `AsyncIOScheduler` runs inside the same event loop as FastAPI. Jobs are async functions — they don't block web requests. If the process crashes, systemd restarts it. No message broker, no worker process, no extra 200-300MB of RAM.
 
@@ -688,11 +895,13 @@ The system stores every buy transaction as a separate lot with its own date and 
 </details>
 
 <details>
-<summary><b>Why two Gemini models (Flash + Pro)?</b></summary>
+<summary><b>Why three parsing tiers (local + Gemini Flash + Gemini Pro + LiteLLM fallback)?</b></summary>
 
-Extraction is a different task than verification. Flash is fast (15 RPM free tier) and great at pulling structured data from messy text. Pro is slow (2 RPM) but catches reasoning errors.
+Extraction is a different task than verification, and known formats need neither. Flash is fast (15 RPM free tier) and great at pulling structured data from messy text. Pro is slow (2 RPM) but catches reasoning errors.
 
 In testing, the Pro verification step flagged ~15% of extraction errors — wrong transaction types, inverted buy/sell amounts, misidentified currencies. The two-model pipeline costs nothing (free tier) and significantly improves accuracy.
+
+LiteLLM is the fallback when Gemini is unavailable or rate-limited. It accepts any OpenAI-compatible endpoint — including a corporate internal gateway (used during development for this project). Services call `get_ai_provider(type)` and never import provider code directly, so swapping the backend requires only a config change.
 
 </details>
 
@@ -705,12 +914,62 @@ Eight rules that every phase must follow:
 2. **Every asset class handler implements the full interface**, including `as_of_date` for future tax simulation.
 3. **Tax rules are configuration, not code.** Rates are class-level constants, not buried in if/else.
 4. **Business logic lives only in the service layer.** Routes don't compute. Repositories don't decide.
-5. **External clients have no business logic.** Gemini, Twilio, yfinance are generic wrappers.
+5. **External clients have no business logic.** Gemini, WhatsApp Cloud, yfinance are generic wrappers.
 6. **All schema changes go through Alembic.** No manual `ALTER TABLE`.
 7. **JSON columns are for display-only data.** Anything queryable gets a proper column.
 8. **`holdings_summary` is a rebuildable cache.** Drop it, recompute from transactions, lose nothing.
 
 These constraints exist because Phase 2 and 3 need to compose with Phase 1 services. If business logic leaks into routes or templates, new features can't reuse it.
+
+</details>
+
+<details>
+<summary><b>Why must corporate actions be user-approved, never auto-applied?</b></summary>
+
+The system auto-detects bonus shares, splits, symbol changes, demergers, and mergers via the NSE CA API (daily sync at 6:00 AM IST). Detected actions are flagged as pending — users review and approve before application. No silent mutation of holdings.
+
+Consumed transactions are soft-marked (`consumed_by_demerger`, `consumed_by_merger`) rather than deleted, so the full audit trail is preserved. This matters for a 50-year application where tracing a cost-basis decision back years later must be possible.
+
+</details>
+
+<details>
+<summary><b>How does historical CA reconciliation work?</b></summary>
+
+When a user imports 5 years of Zerodha tradebook, holdings are silently wrong until all historical corporate actions are also applied.
+
+```mermaid
+flowchart TD
+    Import["Import Tradebook\n(5 years of Zerodha CSV)"]
+    Holdings["Holdings Computed\n(raw — possibly wrong)"]
+    Fetch["Full CA History Fetch\nNSE API from first_entry_date → today"]
+    Compare["Compare expected vs actual quantities\nper symbol"]
+    Warn["⚠️ Discrepancy indicators\non Holdings page"]
+    Apply["User reviews & one-click applies\neach missing CA"]
+
+    Import --> Holdings --> Fetch --> Compare --> Warn --> Apply
+```
+
+`symbol_fetch_tracking.first_entry_date` defines the start of the CA fetch range per symbol. The Holdings Baseline Check (Sprint 17) provides a further manual catch-all by comparing NEESH quantities against a Zerodha CSV export.
+
+</details>
+
+<details>
+<summary><b>How does remote access work without port forwarding?</b></summary>
+
+ZROK provides a static share URL that tunnels to `localhost:8000` on the Pi. When the Pi restarts, a Cloudflare Worker is notified with the new tunnel URL and updates its KV store. Family members bookmark `neesh.pages.dev` — that page fetches the current URL from KV and redirects. The stable landing URL never changes regardless of Pi restarts.
+
+```mermaid
+flowchart LR
+    User["👨‍👩‍👧 Family\n(bookmark neesh.pages.dev)"]
+    Pages["Cloudflare Pages\n(stable URL)"]
+    Worker["Cloudflare Worker + KV\n(stores current ZROK URL)"]
+    Tunnel["ZROK Tunnel\n(static share URL)"]
+    Pi["Raspberry Pi\nlocalhost:8000"]
+
+    User --> Pages --> Worker --> Tunnel --> Pi
+```
+
+No port forwarding. No static IP. ZROK and the Cloudflare Worker are both free tier.
 
 </details>
 
@@ -862,7 +1121,7 @@ Highlights:
 | **Tailwind CSS** | A utility-first CSS framework where you style elements with small class names (`bg-blue-500`, `text-lg`) instead of writing custom CSS. | Handles all UI styling including dark mode and responsive layouts. |
 | **Jinja2** | A Python templating engine that turns HTML templates with placeholders into final HTML pages on the server. | Renders every page — dashboards, forms, tables — by injecting data from the service layer into HTML templates. |
 | **JWT (JSON Web Token)** | A compact, signed token issued after login. The browser sends it with every request to prove identity. | Two tokens: a short-lived access token (30 min) and a long-lived refresh token (30 days). Users stay logged in without re-entering OTP daily. |
-| **OTP (One-Time Password)** | A 6-digit code sent via WhatsApp for login. Valid for a few minutes, single use. | Primary authentication method — no passwords to remember or leak. |
+| **OTP (One-Time Password)** | A 6-digit code sent via WhatsApp or Email for login. Valid for a few minutes, single use. | Primary authentication method — no passwords to remember or leak. Delivery priority: WhatsApp Cloud API → Email SMTP → console (dev only). |
 | **Alembic** | A database migration tool for SQLAlchemy. Each schema change is a numbered script that can be applied or rolled back. | Manages all database structure changes across app versions. Critical for a 50-year data lifespan. |
 | **SQLAlchemy** | A Python ORM (Object-Relational Mapper) that lets you work with database tables as Python objects instead of raw SQL. | Defines all data models (User, Transaction, Holding) and handles async database queries. |
 | **APScheduler** | A Python library for scheduling background tasks (like cron jobs) inside your application process. | Runs daily price refresh, forex rate updates, net worth snapshots, and weekly backups — all without a separate worker process. |
@@ -874,8 +1133,10 @@ Highlights:
 | **NAV (Net Asset Value)** | The per-unit price of a mutual fund, published daily by the fund house. | Fetched from AMFI's public API to value mutual fund holdings. |
 | **AMFI** | Association of Mutual Funds in India — maintains a public database of all mutual fund NAVs and scheme codes. | Primary data source for mutual fund prices and fund search/lookup. |
 | **yfinance** | A Python library that fetches stock/ETF prices, historical data, and metadata from Yahoo Finance. | Provides live and historical prices for stocks, ETFs, and SGBs (via gold price). |
-| **Gemini (Flash / Pro)** | Google's AI models. Flash is fast and good at structured extraction. Pro is slower but better at reasoning and verification. | Flash extracts transaction data from uploaded statements. Pro re-verifies the extraction for accuracy. Both on free tier. |
-| **Twilio** | A cloud communications API for sending SMS, WhatsApp messages, and making calls. | Sends OTP codes via WhatsApp for login. Phase 3 will reuse it for investment alert notifications. |
+| **Gemini (Flash / Pro)** | Google's AI models. Flash is fast and good at structured extraction. Pro is slower but better at reasoning and verification. | Flash extracts transaction data from uploaded statements. Pro re-verifies the extraction for accuracy. Both on free tier. Multiple API keys supported for quota rotation. |
+| **LiteLLM** | An OpenAI-compatible API proxy that routes requests to many backend LLMs. | Fallback AI endpoint when Gemini is unavailable or rate-limited. Configured via `LITELLM_*` env vars to point at any OpenAI-compatible gateway (e.g. a corporate internal LLM). |
+| **WhatsApp Cloud API** | Meta's official WhatsApp Business API, free tier. | Primary OTP delivery channel for login — the highest-priority channel in the fallback chain (WhatsApp Cloud → Email SMTP → Console). |
+| **Twilio** | A legacy cloud communications API previously used for OTP delivery via WhatsApp. | **Deprecated for OTP** — replaced by WhatsApp Cloud API. Config still accepted for backward compatibility. |
 | **systemd** | Linux's service manager — starts, stops, and auto-restarts background processes. | Runs the NEESH server as a system service that starts on boot and auto-restarts on crash. |
 | **Cloudflare Tunnel** | A secure tunnel that exposes a local server to the internet via Cloudflare's network — no port forwarding or static IP needed. | Enables accessing NEESH from outside the home network over HTTPS. |
 | **Upsert** | A database operation: insert a row if it doesn't exist, or update it if it does. | Used for `holdings_summary` — after recomputation, the holding row is created or updated in one atomic operation. |
