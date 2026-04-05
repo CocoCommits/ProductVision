@@ -65,7 +65,7 @@ flowchart TB
 
     subgraph phase2["📋 Phase 2 — PLANNED"]
         direction LR
-        G["💸 Expense Tracking"] ~~~ H["🏠 Loan Simulator"] ~~~ I["🧾 Tax Simulator"]
+        L["💸 Expense Tracking"] ~~~ M["🏠 Loan Simulator"] ~~~ N["🧾 Tax Simulator"]
     end
 
     subgraph phase3["🔮 Phase 3 — FUTURE"]
